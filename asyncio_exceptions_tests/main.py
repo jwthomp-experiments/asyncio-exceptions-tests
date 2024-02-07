@@ -3,7 +3,22 @@ import queue
 import janus
 
 
-async def queue_processor(async_q: janus.AsyncQueue[int]):
+# At least one task has failed, so we need to clean up.
+# A task completed if cancelled is False, AND exception is None.
+# A task has an exception if cancelled is False, AND exception is not None.
+# A task is cancelled if cancelled is True. (If you check exception, an exception will be raised.)
+def get_task_status(task):
+    if task.done() is False:
+        return("running", "")
+    elif task.cancelled():
+        return ("cancelled", "")
+    elif task.exception() is not None:
+        return ("exception", task.exception())
+    else:
+        return ("completed", task.result())
+
+
+async def queue_processor(async_q: janus.AsyncQueue[int], crash: bool = True):
     # Continuously look for events in the queue and process them.
     # The queue will be closed outside of this function when the replay is done.
     while async_q.closed is False:
@@ -15,20 +30,21 @@ async def queue_processor(async_q: janus.AsyncQueue[int]):
         # If there was nothing on the queue, then wait for a second before checking again.
         await asyncio.sleep(1)
 
-        crash_queue_processor()
+        if crash:
+            crash_queue_processor()
     print("======> Processor finished")
 
         
 
-async def queue_injector(queue: janus.Queue[int], join_and_close_queue: bool = False):
+async def queue_injector(queue: janus.Queue[int], crash: bool = True, join_and_close_queue: bool = False):
     async_q = queue.async_q
     await asyncio.sleep(2)
     for i in range(10):
         await async_q.put(i)
         print(f"Injected {i}")
     
-    
-    await crash_queue_injector()
+    if crash:
+        await crash_queue_injector()
     
     print("======> Injector finished")
     if join_and_close_queue:
@@ -46,7 +62,7 @@ async def main():
     queue = janus.Queue()
 
     task_processor = asyncio.create_task(queue_processor(queue.async_q))
-    task_injector = asyncio.create_task(queue_injector(queue))
+    task_injector = asyncio.create_task(queue_injector(queue, crash=False))
 
     try:
         # Wait for the injector to finish
@@ -99,18 +115,6 @@ async def main_task_group_exceptions():
             # this is no bueno.
             task_injector = tg.create_task(queue_injector(queue, join_and_close_queue=True))
     except* Exception as e:
-        # At least one task has failed, so we need to clean up.
-        # A task completed if cancelled is False, AND exception is None.
-        # A task has an exception if cancelled is False, AND exception is not None.
-        # A task is cancelled if cancelled is True. (If you check exception, an exception will be raised.)
-        def get_task_status(task):
-            if task.cancelled():
-                return ("cancelled", None)
-            elif task.exception() is not None:
-                return ("exception", task.exception())
-            else:
-                return ("completed", task.result())
-
         # We'll just print out the status of each task.
         (status, value) = get_task_status(task_processor)
         print(f"Processor: {status} - {value}")
@@ -132,18 +136,38 @@ async def main_task_group_exceptions():
 
 
 async def main_async_futures_exceptions():
+    loop = asyncio.get_event_loop()
     queue = janus.Queue()
 
     task_processor = asyncio.create_task(queue_processor(queue.async_q))
-    task_injector = asyncio.create_task(queue_injector(queue.async_q))
+    future_processor = loop.create_future()
+    task_processor.add_done_callback(future_processor.set_result)
+    
+    task_injector = asyncio.create_task(queue_injector(queue, crash=False))
+    future_injector = loop.create_future()
+    task_injector.add_done_callback(future_injector.set_result)
 
     # Wait for the injector to finish
-    await task_injector
+    await future_injector
     exc = task_injector.exception()
-    print("task_injector Exception:", exc)
+
+    if exc is not None:
+        print("task_injector Exception:", exc)
+        # Need to shut down processor and queue
+        queue.close()
+        await queue.wait_closed()
+        await future_processor
+        exc = task_processor.exception()
+        if exc is not None:
+            print("task_processor Exception:", exc)
+        return
+
     print("======> Injector finished")
    
-
+    ########################################################################################
+    # PROBLEM: If Injector finishes, but processor crashes, then the queue will never empty,
+    # And we'll never get past here.
+    ########################################################################################
 
     # Now wait for the queue to be finished processing
     await queue.async_q.join()
@@ -153,9 +177,64 @@ async def main_async_futures_exceptions():
     await queue.wait_closed()
 
     # Queue is closed, so wait for processor to detect this and finish
-    await task_processor
+    await future_processor
     exc = task_processor.exception()
-    print("task_processor Exception:", exc)
+    if exc is not None:
+        print("task_processor Exception:", exc)
+
+    # At least one task has failed, so we need to clean up.
+        # A task completed if cancelled is False, AND exception is None.
+        # A task has an exception if cancelled is False, AND exception is not None.
+        # A task is cancelled if cancelled is True. (If you check exception, an exception will be raised.)
+        def get_task_status(task):
+            if task.cancelled():
+                return ("cancelled", None)
+            elif task.exception() is not None:
+                return ("exception", task.exception())
+            else:
+                return ("completed", task.result())
+
+async def main_async_gather_exceptions():
+    queue = janus.Queue()
+
+    task_processor = asyncio.create_task(queue_processor(queue.async_q))
+    task_injector = asyncio.create_task(queue_injector(queue, crash=False, join_and_close_queue=True))
+
+    tasks = [task_processor, task_injector]
+
+    # Wait for the injector to finish
+    group = asyncio.gather(*tasks)
+
+    try:
+        await group
+    except Exception as e:
+        # We'll just print out the status of each task.
+        (status, value) = get_task_status(task_processor)
+        print(f"Processor: {status} - {value}")
+
+        (status, value) = get_task_status(task_injector)
+        print(f"Injector: {status} - {value}")
+
+        # Cancel all running tasks
+        for task in tasks:
+            if task.done() is False:
+                task.cancel()
+                await asyncio.sleep(1)
+        
+        # Close the queue and then return
+        queue.close()
+        await queue.wait_closed()
+        return
+
+    # Now wait for the queue to be finished processing
+    group = queue.async_q.join()
+
+    # Queue is empty, so close it
+    queue.close()
+    await queue.wait_closed()
+
+    # Queue is closed, so wait for processor to detect this and finish
+    await asyncio.gather(task_processor)
 
 
 if __name__ == "__main__":
@@ -164,7 +243,10 @@ if __name__ == "__main__":
 
     # Exception handling with TaskGroup
     # This requires Python >= 3.11
-    asyncio.run(main_task_group_exceptions())
+    #asyncio.run(main_task_group_exceptions())
 
     # Exception handling with futures
     #asyncio.run(main_async_futures_exceptions())
+
+    # Exception handling with gather
+    asyncio.run(main_async_gather_exceptions())
